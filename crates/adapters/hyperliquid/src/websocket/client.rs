@@ -51,8 +51,8 @@ use nautilus_network::{
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
-        channel_message_handler,
+        AuthTracker, SubscriptionState, TransportBackend, WS_RTT_HL, WebSocketClient,
+        WebSocketConfig, channel_message_handler,
     },
 };
 use parking_lot::Mutex;
@@ -349,6 +349,7 @@ impl HyperliquidWebSocketClient {
                 return Err(e.into());
             }
         };
+        client.set_rtt_key(WS_RTT_HL);
 
         if let Some(control) = &self.socket_control {
             let handle = client.reconnect_handle();

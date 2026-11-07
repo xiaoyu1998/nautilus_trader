@@ -38,7 +38,7 @@ use nautilus_network::{
     RECONNECTED,
     error::SendError,
     retry::{RetryError, RetryManager, create_websocket_retry_manager},
-    websocket::{SubscriptionState, WebSocketClient},
+    websocket::{SubscriptionState, WS_RTT_HL, WebSocketClient, record_rtt_ms},
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -257,6 +257,8 @@ pub(super) struct FeedHandler {
     rate_limits: Arc<WebSocketRateLimits>,
     client_id: u64,
     heartbeat: tokio::time::Interval,
+    /// Stamp for the last outbound app-level `{"method":"ping"}`.
+    ping_sent: Option<std::time::Instant>,
     retry_manager: RetryManager<HyperliquidWsError>,
     retry_manager_post: RetryManager<PostSendError>,
     message_buffer: VecDeque<NautilusWsMessage>,
@@ -311,6 +313,7 @@ impl FeedHandler {
             rate_limits,
             client_id,
             heartbeat,
+            ping_sent: None,
             retry_manager: create_websocket_retry_manager(),
             retry_manager_post: create_websocket_retry_manager(),
             message_buffer: VecDeque::new(),
@@ -567,6 +570,15 @@ impl FeedHandler {
 
                             match super::messages::decode_ws_message(&text) {
                                 Ok(msg) => {
+                                    if matches!(msg, HyperliquidWsMessage::Pong) {
+                                        if let Some(sent) = self.ping_sent.take() {
+                                            let ms = u64::try_from(sent.elapsed().as_millis())
+                                                .unwrap_or(u64::MAX);
+                                            record_rtt_ms(WS_RTT_HL, ms);
+                                        }
+                                        continue;
+                                    }
+
                                     if let HyperliquidWsMessage::Post { data } = msg {
                                         self.post_router.complete(data).await;
                                         continue;
@@ -649,12 +661,14 @@ impl FeedHandler {
                 }
 
                 _ = self.heartbeat.tick() => {
-                    if self.client.as_ref().is_some_and(WebSocketClient::is_active)
-                        && let Err(e) = self.send_with_retry(
+                    if self.client.as_ref().is_some_and(WebSocketClient::is_active) {
+                        self.ping_sent = Some(std::time::Instant::now());
+                        if let Err(e) = self.send_with_retry(
                             HEARTBEAT_MESSAGE.to_string(),
                         ).await
-                    {
-                        log::error!("Error sending WebSocket heartbeat: {e}");
+                        {
+                            log::error!("Error sending WebSocket heartbeat: {e}");
+                        }
                     }
                 }
 

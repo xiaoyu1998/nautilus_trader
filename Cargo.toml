@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates",
   "crates/adapters/architect_ax",
+  "crates/adapters/aster",
   "crates/adapters/betfair",
   "crates/adapters/binance",
   "crates/adapters/blockchain",
@@ -19,8 +20,10 @@ members = [
   "crates/adapters/lighter",
   "crates/adapters/okx",
   "crates/adapters/polymarket",
+  "crates/adapters/predict_fun",
   "crates/adapters/sandbox",
   "crates/adapters/tardis",
+  "crates/adapters/txflow",
   "crates/analysis",
   "crates/backtest",
   "crates/cli",
@@ -95,6 +98,7 @@ nautilus-trading = { path = "crates/trading", version = "0.67.0" }
 # -----------------------------------------------------------------------------
 nautilus-architect-ax = { path = "crates/adapters/architect_ax", version = "0.67.0" }
 nautilus-betfair = { path = "crates/adapters/betfair", version = "0.67.0", default-features = false }
+nautilus-aster = { path = "crates/adapters/aster", version = "0.67.0" }
 nautilus-binance = { path = "crates/adapters/binance", version = "0.67.0", default-features = false }
 nautilus-blockchain = { path = "crates/adapters/blockchain", version = "0.67.0" }
 nautilus-bybit = { path = "crates/adapters/bybit", version = "0.67.0", default-features = false }
@@ -110,8 +114,10 @@ nautilus-kraken = { path = "crates/adapters/kraken", version = "0.67.0", default
 nautilus-lighter = { path = "crates/adapters/lighter", version = "0.67.0", default-features = false }
 nautilus-okx = { path = "crates/adapters/okx", version = "0.67.0", default-features = false }
 nautilus-polymarket = { path = "crates/adapters/polymarket", version = "0.67.0", default-features = false }
+nautilus-predict-fun = { path = "crates/adapters/predict_fun", version = "0.67.0", default-features = false }
 nautilus-sandbox = { path = "crates/adapters/sandbox", version = "0.67.0", default-features = false }
 nautilus-tardis = { path = "crates/adapters/tardis", version = "0.67.0", default-features = false }
+nautilus-txflow = { path = "crates/adapters/txflow", version = "0.67.0" }
 
 # -----------------------------------------------------------------------------
 # Core dependencies

@@ -38,6 +38,7 @@
 //! does not imply a response timeout. Handler mode can separately reconnect when no frame arrives
 //! before a heartbeat timeout or when no text or binary application data arrives before the idle
 //! timeout. Ping and Pong reset the frame timeout but not the application-data idle timeout.
+//! Optional [`rtt`] sampling records outbound Ping → inbound Pong latency when a venue key is set.
 //!
 //! # State reporting and explicit reconnect
 //!
@@ -80,6 +81,7 @@ pub mod client;
 pub mod config;
 pub mod consts;
 pub mod proxy;
+pub mod rtt;
 pub mod subscription;
 pub mod types;
 
@@ -90,6 +92,10 @@ pub use client::{
 };
 pub use config::{InitialConnectRetryPolicy, TransportBackend, WebSocketConfig};
 pub use consts::{AUTHENTICATION_TIMEOUT_SECS, TEXT_PING, TEXT_PONG};
+pub use rtt::{
+    RttProbe, SharedRttProbe, WS_RTT_ASTER, WS_RTT_BN, WS_RTT_HL, WS_RTT_LIGHTER, WS_RTT_TXFLOW,
+    last_rtt_ms, last_rx_bytes, record_rtt_ms, record_rx_bytes,
+};
 pub use subscription::{SubscriptionSnapshot, SubscriptionState, split_topic};
 pub use types::{
     CloseHandler, EpochMessageHandler, EpochPingHandler, MessageHandler, MessageReader,

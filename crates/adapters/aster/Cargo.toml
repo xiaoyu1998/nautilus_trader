@@ -1,0 +1,65 @@
+[package]
+name = "nautilus-aster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Aster (asterdex) perpetual futures public market-data adapter for Nautilus (MVP)"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_aster"
+crate-type = ["rlib"]
+
+[features]
+default = ["high-precision"]
+high-precision = ["nautilus-model/high-precision"]
+
+[package.metadata.docs.rs]
+features = ["high-precision"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
+nautilus-live = { workspace = true }
+nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
+
+async-trait = { workspace = true }
+
+anyhow = { workspace = true }
+ustr = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bin]]
+name = "aster-list-markets"
+path = "bin/list_markets.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "aster-bbo-watch"
+path = "bin/bbo_watch.rs"
+doc = false
+test = false

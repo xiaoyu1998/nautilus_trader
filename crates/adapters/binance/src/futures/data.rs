@@ -37,10 +37,10 @@ use nautilus_common::{
             BarsResponse, BookResponse, CustomDataResponse, DataResponse, FundingRatesResponse,
             InstrumentResponse, InstrumentsResponse, RequestBars, RequestBookSnapshot,
             RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments,
-            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeCustomData,
+            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth, SubscribeCustomData,
             SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument, SubscribeInstruments,
             SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeCustomData, UnsubscribeFundingRates,
+            UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeCustomData, UnsubscribeFundingRates,
             UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
             subscribe::SubscribeInstrumentStatus, unsubscribe::UnsubscribeInstrumentStatus,
         },
@@ -110,7 +110,7 @@ use crate::{
             messages::BinanceFuturesWsStreamsMessage,
             parse_data::{
                 parse_agg_trade, parse_book_ticker, parse_depth_snapshot, parse_depth_update,
-                parse_kline, parse_mark_price, parse_ticker, parse_trade,
+                parse_kline, parse_mark_price, parse_order_book_depth, parse_ticker, parse_trade,
             },
         },
     },
@@ -143,6 +143,9 @@ pub struct BinanceFuturesDataClient {
     instrument_update_lock: Arc<tokio::sync::Mutex<()>>,
     book_sync: BookSyncTracker,
     book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
+    /// Partial depth snapshot streams (`depth5|10|20`) emitting [`OrderBookDepth`].
+    /// Separate from `book_subscriptions` so depth can coexist with quote (L1) bookTicker.
+    book_depth_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
     book_unsubscribes_pending: Arc<AtomicMap<InstrumentId, Vec<BookDrain>>>,
     l1_book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
     quote_refs: Arc<AtomicMap<InstrumentId, u32>>,
@@ -287,6 +290,7 @@ impl BinanceFuturesDataClient {
             instrument_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             book_sync,
             book_subscriptions: Arc::new(AtomicMap::new()),
+            book_depth_subscriptions: Arc::new(AtomicMap::new()),
             book_unsubscribes_pending: Arc::new(AtomicMap::new()),
             l1_book_subscriptions: Arc::new(AtomicMap::new()),
             quote_refs: Arc::new(AtomicMap::new()),
@@ -656,6 +660,7 @@ impl BinanceFuturesDataClient {
         ws_instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         book_sync: &BookSyncTracker,
         book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
+        book_depth_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
         book_unsubscribes_pending: &Arc<AtomicMap<InstrumentId, Vec<BookDrain>>>,
         l1_book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
         force_order_refs: &Arc<AtomicMap<InstrumentId, u32>>,
@@ -703,6 +708,23 @@ impl BinanceFuturesDataClient {
             BinanceFuturesWsStreamsMessage::DepthUpdate(ref depth_msg) => {
                 if let Some(instrument) = cache.get(&depth_msg.symbol) {
                     let instrument_id = instrument.id();
+
+                    // OrderBookDepth path (depth5/10/20) — independent of L1 quotes.
+                    if let Some(levels) =
+                        book_depth_subscriptions.load().get(&instrument_id).copied()
+                    {
+                        match parse_order_book_depth(depth_msg, instrument, ts_init, levels as usize)
+                        {
+                            Ok(depth) => {
+                                Self::send_data(data_sender, Data::BookDepth(Box::new(depth)));
+                            }
+                            Err(e) => log::warn!("Failed to parse order book depth: {e}"),
+                        }
+                        // Same stream may also feed deltas subscribers; fall through if present.
+                        if !book_subscriptions.contains_key(&instrument_id) {
+                            return;
+                        }
+                    }
 
                     let Some(depth) = book_subscriptions.load().get(&instrument_id).copied() else {
                         return;
@@ -1189,6 +1211,7 @@ impl DataClient for BinanceFuturesDataClient {
         self.force_order_all_market_stream_active
             .store(false, Ordering::Release);
         self.book_subscriptions.store(AHashMap::new());
+        self.book_depth_subscriptions.store(AHashMap::new());
         self.book_unsubscribes_pending.store(AHashMap::new());
         self.l1_book_subscriptions.store(AHashMap::new());
         self.quote_refs.store(AHashMap::new());
@@ -1251,6 +1274,7 @@ impl DataClient for BinanceFuturesDataClient {
             let ws_insts = self.ws_client.instruments_cache();
             let book_sync = self.book_sync.clone();
             let book_subs = self.book_subscriptions.clone();
+            let book_depth_subs = self.book_depth_subscriptions.clone();
             let book_unsubscribes_pending = self.book_unsubscribes_pending.clone();
             let l1_book_subs = self.l1_book_subscriptions.clone();
             let force_order_refs = self.force_order_refs.clone();
@@ -1280,6 +1304,7 @@ impl DataClient for BinanceFuturesDataClient {
                                 &ws_insts,
                                 &book_sync,
                                 &book_subs,
+                                &book_depth_subs,
                                 &book_unsubscribes_pending,
                                 &l1_book_subs,
                                 &force_order_refs,
@@ -1309,6 +1334,7 @@ impl DataClient for BinanceFuturesDataClient {
             let pub_ws_insts = self.ws_public_client.instruments_cache();
             let pub_book_sync = self.book_sync.clone();
             let pub_book_subs = self.book_subscriptions.clone();
+            let pub_book_depth_subs = self.book_depth_subscriptions.clone();
             let pub_book_unsubscribes_pending = self.book_unsubscribes_pending.clone();
             let pub_l1_book_subs = self.l1_book_subscriptions.clone();
             let pub_force_order_refs = self.force_order_refs.clone();
@@ -1336,6 +1362,7 @@ impl DataClient for BinanceFuturesDataClient {
                                 &pub_ws_insts,
                                 &pub_book_sync,
                                 &pub_book_subs,
+                                &pub_book_depth_subs,
                                 &pub_book_unsubscribes_pending,
                                 &pub_l1_book_subs,
                                 &pub_force_order_refs,
@@ -1500,6 +1527,7 @@ impl DataClient for BinanceFuturesDataClient {
         self.force_order_all_market_stream_active
             .store(false, Ordering::Release);
         self.book_subscriptions.store(AHashMap::new());
+        self.book_depth_subscriptions.store(AHashMap::new());
         self.book_unsubscribes_pending.store(AHashMap::new());
         self.l1_book_subscriptions.store(AHashMap::new());
         self.quote_refs.store(AHashMap::new());
@@ -1721,6 +1749,45 @@ impl DataClient for BinanceFuturesDataClient {
                         .context("book deltas subscription")
                 }),
                 "order book subscription",
+            );
+
+            Ok(())
+        })
+    }
+
+    fn subscribe_book_depth(&mut self, cmd: SubscribeBookDepth) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            let cmd = cmd.with_instrument_ids(instrument_id);
+            if cmd.book_type != BookType::L2_MBP {
+                anyhow::bail!("Binance Futures book depth supports L2_MBP only");
+            }
+
+            let depth = cmd.depth.map_or(10, |d| d.get() as u32);
+            if !is_partial_book_depth(depth) {
+                anyhow::bail!(
+                    "Binance Futures subscribe_book_depth requires depth 5|10|20, was {depth}"
+                );
+            }
+
+            if let Some(existing) = self.book_depth_subscriptions.load().get(&instrument_id) {
+                anyhow::ensure!(
+                    *existing == depth,
+                    "Binance Futures book depth cannot change while subscribed"
+                );
+                return Ok(());
+            }
+
+            self.book_depth_subscriptions.insert(instrument_id, depth);
+
+            let stream = book_stream(&instrument_id, depth);
+            let ws = self.ws_public_client.clone();
+            self.spawn_ws(
+                chain_command(&self.book_command_tail, async move {
+                    ws.subscribe(vec![stream])
+                        .await
+                        .context("book depth subscription")
+                }),
+                "book depth subscription",
             );
 
             Ok(())
@@ -1976,6 +2043,46 @@ impl DataClient for BinanceFuturesDataClient {
                     }
                 }),
                 "order book unsubscribe",
+            );
+
+            Ok(())
+        })
+    }
+
+    fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> anyhow::Result<()> {
+        execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
+            let Some(depth) = self
+                .book_depth_subscriptions
+                .load()
+                .get(&instrument_id)
+                .copied()
+            else {
+                return Ok(());
+            };
+
+            self.book_depth_subscriptions.remove(&instrument_id);
+
+            // If deltas still hold the same partial stream, keep the WS subscription.
+            if self
+                .book_subscriptions
+                .load()
+                .get(&instrument_id)
+                .copied()
+                == Some(depth)
+            {
+                return Ok(());
+            }
+
+            let stream = book_stream(&instrument_id, depth);
+            let ws = self.ws_public_client.clone();
+            self.spawn_ws(
+                chain_command(&self.book_command_tail, async move {
+                    ws.unsubscribe(vec![stream])
+                        .await
+                        .context("book depth unsubscribe")
+                        .map(|_| ())
+                }),
+                "book depth unsubscribe",
             );
 
             Ok(())

@@ -1,0 +1,49 @@
+[package]
+name = "lightbot-strategies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Trading strategies for Lightbot"
+
+[dependencies]
+nautilus-trading = { workspace = true }
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-indicators = { workspace = true }
+nautilus-model = { workspace = true }
+nautilus-core = { workspace = true }
+nautilus-live = { workspace = true, features = ["node"] }
+nautilus-bybit = { workspace = true }
+nautilus-binance = { workspace = true }
+nautilus-hyperliquid = { workspace = true }
+nautilus-okx = { workspace = true }
+nautilus-polymarket = { workspace = true, default-features = true }
+nautilus-system = { workspace = true }
+nautilus-data = { workspace = true }
+nautilus-backtest = { workspace = true }
+nautilus-execution = { workspace = true }
+nautilus-persistence = { workspace = true }
+
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = "1.0"
+tokio-tungstenite = { version = "0.24", default-features = true }
+futures-util = "0.3"
+url = "2"
+tracing-log = "0.2"
+
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+rust_decimal = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ustr = { workspace = true }
+
+[[bin]]
+name = "pump_dump_detector"
+path = "src/bin/pump_dump_detector.rs"

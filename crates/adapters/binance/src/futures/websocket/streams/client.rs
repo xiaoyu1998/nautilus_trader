@@ -47,6 +47,7 @@ use nautilus_network::{
     mode::ConnectionMode,
     websocket::{
         PingHandler, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
+        WS_RTT_BN,
         channel_message_handler,
     },
 };
@@ -670,6 +671,7 @@ impl BinanceFuturesWebSocketClient {
             .connect()
             .await
             .map_err(|e| BinanceWsError::NetworkError(e.to_string()))?;
+        client.set_rtt_key(WS_RTT_BN);
 
         let connection_mode = client.connection_mode_atomic();
         let reconnect_handle = client.reconnect_handle();

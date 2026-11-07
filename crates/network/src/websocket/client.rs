@@ -102,6 +102,7 @@ use super::{
         CONNECTION_STATE_CHECK_INTERVAL_MS, GRACEFUL_SHUTDOWN_DELAY_MS,
         GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
     },
+    rtt::{RttProbe, SharedRttProbe},
     types::{
         CloseHandler, EpochMessageHandler, EpochPingHandler, MessageHandler, MessageReader,
         MessageWriter, PingHandler, WriterCommand,
@@ -193,6 +194,8 @@ pub struct WebSocketClientInner {
     reconnect_buffer_waits_for_auth: Arc<AtomicBool>,
     state_sink: Option<SocketStateSink>,
     connection_rate_limit: Option<ConnectionRateLimit>,
+    /// Shared ping→pong RTT probe (frame heartbeat).
+    rtt: SharedRttProbe,
 }
 
 #[derive(Clone, Debug)]
@@ -289,12 +292,14 @@ impl WebSocketClientInner {
             state_sink.clone(),
         );
 
+        let rtt = Arc::new(RttProbe::new());
         let heartbeat_task = config.heartbeat_interval_secs.map(|heartbeat_interval| {
             Self::spawn_heartbeat_task(
                 Arc::clone(&connection_mode),
                 heartbeat_interval,
                 config.heartbeat_payload.clone(),
                 writer_tx.clone(),
+                Arc::clone(&rtt),
             )
         });
 
@@ -329,6 +334,7 @@ impl WebSocketClientInner {
             reconnect_buffer_waits_for_auth,
             state_sink,
             connection_rate_limit: None,
+            rtt,
         })
     }
 
@@ -500,6 +506,7 @@ impl WebSocketClientInner {
             ConnectionMode::complete_reconnect_with_sink(&connection_mode, state_sink.as_ref());
         debug_assert_eq!(outcome, ReconnectOutcome::Reconnected);
 
+        let rtt = Arc::new(RttProbe::new());
         let (read_task, read_fence) = if is_stream_mode {
             (None, None)
         } else {
@@ -516,6 +523,7 @@ impl WebSocketClientInner {
                 state_sink.as_ref(),
                 config.idle_timeout_ms,
                 heartbeat_timeout,
+                Arc::clone(&rtt),
             );
             (Some(read_task), Some(read_fence))
         };
@@ -545,6 +553,7 @@ impl WebSocketClientInner {
                 heartbeat_secs,
                 config.heartbeat_payload.clone(),
                 writer_tx.clone(),
+                Arc::clone(&rtt),
             )
         });
 
@@ -574,6 +583,7 @@ impl WebSocketClientInner {
             reconnect_buffer_waits_for_auth,
             state_sink,
             connection_rate_limit,
+            rtt,
         })
     }
 
@@ -1616,6 +1626,7 @@ impl WebSocketClientInner {
             self.state_sink.as_ref(),
             self.config.idle_timeout_ms,
             self.heartbeat_timeout,
+            Arc::clone(&self.rtt),
         ));
         self.read_fence = Some(read_fence);
 
@@ -1653,6 +1664,7 @@ impl WebSocketClientInner {
         state_sink: Option<&SocketStateSink>,
         idle_timeout_ms: Option<u64>,
         heartbeat_timeout: Option<Duration>,
+        rtt: SharedRttProbe,
     ) -> dst::task::JoinHandle<()> {
         log::debug!("Started message handler task 'read'");
 
@@ -1696,6 +1708,7 @@ impl WebSocketClientInner {
                     Ok(Some(Ok(Message::Binary(data)))) => {
                         log::trace!("Received message <binary> {} bytes", data.len());
                         last_data_time = dst::time::Instant::now();
+                        rtt.add_rx_bytes(data.len());
 
                         if !ConnectionMode::from_atomic(&connection_state).is_active()
                             || !read_fence.is_valid()
@@ -1714,6 +1727,7 @@ impl WebSocketClientInner {
                     Ok(Some(Ok(Message::Text(data)))) => {
                         log::trace!("Received text frame ({} bytes)", data.len());
                         last_data_time = dst::time::Instant::now();
+                        rtt.add_rx_bytes(data.len());
 
                         if !ConnectionMode::from_atomic(&connection_state).is_active()
                             || !read_fence.is_valid()
@@ -1756,6 +1770,7 @@ impl WebSocketClientInner {
                     Ok(Some(Ok(Message::Pong(_)))) => {
                         log::trace!("Received pong");
                         // Do not reset last_data_time: pongs are keep-alive replies (not data)
+                        rtt.on_pong();
 
                         if idle_timeout_exceeded(last_data_time, idle_timeout) {
                             break;
@@ -2319,6 +2334,7 @@ impl WebSocketClientInner {
         heartbeat_secs: u64,
         message: Option<String>,
         writer_tx: WriterSender<WriterCommand>,
+        rtt: SharedRttProbe,
     ) -> dst::task::JoinHandle<()> {
         log_task_started("heartbeat");
 
@@ -2333,7 +2349,10 @@ impl WebSocketClientInner {
                             Some(text) => {
                                 WriterCommand::Heartbeat(Message::Text(text.clone().into()))
                             }
-                            None => WriterCommand::Heartbeat(Message::Ping(vec![].into())),
+                            None => {
+                                rtt.mark_ping_sent();
+                                WriterCommand::Heartbeat(Message::Ping(vec![].into()))
+                            }
                         };
 
                         match writer_tx.send_control(msg) {
@@ -2493,6 +2512,7 @@ pub struct WebSocketClient {
     controller_notify: Arc<tokio::sync::Notify>,
     reconnect_published: Arc<AtomicBool>,
     reconnect_supported: bool,
+    rtt: SharedRttProbe,
 }
 
 /// Shared headers used by future automatic WebSocket reconnects.
@@ -2916,6 +2936,7 @@ impl WebSocketClient {
         let state_sink = inner.state_sink.clone();
         let rate_limiter = Self::resolve_rate_limiter(default_quota, keyed_quotas, None)?;
         let writer_tx = inner.writer_tx.clone();
+        let rtt = Arc::clone(&inner.rtt);
         let controller_lifecycle = Arc::new(ControllerLifecycle::new());
 
         let controller_task = Self::spawn_controller_task(
@@ -2948,6 +2969,7 @@ impl WebSocketClient {
                 controller_notify,
                 reconnect_published,
                 reconnect_supported: false,
+                rtt,
             },
         ))
     }
@@ -3187,6 +3209,7 @@ impl WebSocketClient {
         let reconnect_buffer_waits_for_auth = Arc::clone(&inner.reconnect_buffer_waits_for_auth);
         let reconnect_headers = inner.reconnect_headers.clone();
         let state_sink = inner.state_sink.clone();
+        let rtt = Arc::clone(&inner.rtt);
         let controller_lifecycle = Arc::new(ControllerLifecycle::new());
 
         let controller_task = Self::spawn_controller_task(
@@ -3217,6 +3240,7 @@ impl WebSocketClient {
             controller_notify,
             reconnect_published,
             reconnect_supported: true,
+            rtt,
         })
     }
 
@@ -3224,6 +3248,11 @@ impl WebSocketClient {
     #[must_use]
     pub fn reconnect_headers(&self) -> ReconnectHeaders {
         self.reconnect_headers.clone()
+    }
+
+    /// Labels this connection's frame ping→pong RTT samples for [`super::rtt::last_rtt_ms`].
+    pub fn set_rtt_key(&self, key: impl Into<String>) {
+        self.rtt.set_key(key);
     }
 
     /// Returns a cloneable handle to this client's reconnect controller.
@@ -8684,6 +8713,7 @@ mod rust_tests {
             None,
             None,
             None,
+            Arc::new(RttProbe::new()),
         );
 
         recv_rendezvous(polled_rx, "WebSocket reader poll entry").await;
@@ -9212,6 +9242,7 @@ mod rust_tests {
             1,
             payload.map(ToString::to_string),
             writer_tx,
+            Arc::new(RttProbe::new()),
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -9243,6 +9274,7 @@ mod rust_tests {
             1,
             None,
             writer_tx,
+            Arc::new(RttProbe::new()),
         );
 
         let _ = tokio::time::timeout(Duration::from_secs(2), writer_rx.recv())

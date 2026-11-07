@@ -21,7 +21,7 @@ use nautilus_core::nanos::UnixNanos;
 use nautilus_model::{
     data::{
         BarSpecification, BarType, BookOrder, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick,
+        OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
     },
     enums::{
         AggregationSource, AggressorSide, BarAggregation, BookAction, OrderSide, PriceType,
@@ -29,7 +29,7 @@ use nautilus_model::{
     },
     identifiers::TradeId,
     instruments::{Instrument, InstrumentAny},
-    types::Price,
+    types::{Price, Quantity},
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -195,6 +195,80 @@ pub(crate) fn parse_depth_snapshot(
     ts_init: UnixNanos,
 ) -> BinanceWsResult<OrderBookDeltas> {
     parse_book_depth(msg, instrument, ts_init, true)
+}
+
+/// Parses a partial depth snapshot stream frame into [`OrderBookDepth`].
+///
+/// Used by `depth5|10|20@100ms` subscriptions for slippage / L2 consumers that want
+/// fixed-level snapshots rather than delta books.
+pub(crate) fn parse_order_book_depth(
+    msg: &BinanceFuturesDepthUpdateMsg,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+    max_levels: usize,
+) -> BinanceWsResult<OrderBookDepth> {
+    let instrument_id = instrument.id();
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+    let ts_event = parse_millis_or_init(
+        msg.transaction_time,
+        "Futures depth update transaction time",
+        ts_init,
+    );
+
+    let levels = max_levels.max(1);
+    let mut bids = Vec::with_capacity(levels);
+    let mut asks = Vec::with_capacity(levels);
+    let mut bid_counts = Vec::with_capacity(levels);
+    let mut ask_counts = Vec::with_capacity(levels);
+
+    for bid in msg.bids.iter().take(levels) {
+        let price = parse_required_price_at_precision(&bid[0], price_precision, "bid_price")
+            .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+        let size = parse_required_quantity_at_precision(&bid[1], size_precision, "bid_quantity")
+            .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+        bids.push(BookOrder::new(OrderSide::Buy, price, size, 0));
+        bid_counts.push(1);
+    }
+    while bids.len() < levels {
+        bids.push(BookOrder::new(
+            OrderSide::Buy,
+            Price::zero(price_precision),
+            Quantity::zero(size_precision),
+            0,
+        ));
+        bid_counts.push(0);
+    }
+
+    for ask in msg.asks.iter().take(levels) {
+        let price = parse_required_price_at_precision(&ask[0], price_precision, "ask_price")
+            .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+        let size = parse_required_quantity_at_precision(&ask[1], size_precision, "ask_quantity")
+            .map_err(|e| BinanceWsError::ParseError(e.to_string()))?;
+        asks.push(BookOrder::new(OrderSide::Sell, price, size, 0));
+        ask_counts.push(1);
+    }
+    while asks.len() < levels {
+        asks.push(BookOrder::new(
+            OrderSide::Sell,
+            Price::zero(price_precision),
+            Quantity::zero(size_precision),
+            0,
+        ));
+        ask_counts.push(0);
+    }
+
+    Ok(OrderBookDepth::new(
+        instrument_id,
+        bids,
+        asks,
+        bid_counts,
+        ask_counts,
+        RecordFlag::F_SNAPSHOT as u8,
+        msg.final_update_id,
+        ts_event,
+        ts_init,
+    ))
 }
 
 fn parse_book_depth(

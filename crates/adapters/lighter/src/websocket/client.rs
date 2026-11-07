@@ -45,8 +45,8 @@ use nautilus_network::{
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
-        InitialConnectRetryPolicy, SubscriptionState, TransportBackend, WebSocketClient,
-        WebSocketConfig, channel_epoch_message_handler,
+        InitialConnectRetryPolicy, SubscriptionState, TransportBackend, WS_RTT_LIGHTER,
+        WebSocketClient, WebSocketConfig, channel_epoch_message_handler,
     },
 };
 use parking_lot::Mutex;
@@ -512,6 +512,7 @@ impl LighterWebSocketClient {
                     self.ws_timeout_secs,
                 ),
             };
+        client.set_rtt_key(WS_RTT_LIGHTER);
 
         if cancellation_token.is_cancelled()
             || generation != self.connection_generation.load(Ordering::Acquire)
