@@ -93,7 +93,8 @@ pub use client::{
 pub use config::{InitialConnectRetryPolicy, TransportBackend, WebSocketConfig};
 pub use consts::{AUTHENTICATION_TIMEOUT_SECS, TEXT_PING, TEXT_PONG};
 pub use rtt::{
-    RttProbe, SharedRttProbe, WS_RTT_ASTER, WS_RTT_BN, WS_RTT_HL, WS_RTT_LIGHTER, WS_RTT_TXFLOW,
+    RttProbe, SharedRttProbe, WS_RTT_ARCUS, WS_RTT_ASTER, WS_RTT_BN, WS_RTT_HL, WS_RTT_LIGHTER,
+    WS_RTT_TXFLOW,
     last_rtt_ms, last_rx_bytes, record_rtt_ms, record_rx_bytes,
 };
 pub use subscription::{SubscriptionSnapshot, SubscriptionState, split_topic};

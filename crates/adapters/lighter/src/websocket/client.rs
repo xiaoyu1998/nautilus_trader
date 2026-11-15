@@ -512,6 +512,7 @@ impl LighterWebSocketClient {
                     self.ws_timeout_secs,
                 ),
             };
+        // Label before any post-connect traffic; reader already shares this probe.
         client.set_rtt_key(WS_RTT_LIGHTER);
 
         if cancellation_token.is_cancelled()

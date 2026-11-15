@@ -42,6 +42,9 @@ pub const WS_RTT_TXFLOW: &str = "tx";
 /// Lighter market-data WebSocket frame ping/pong key.
 pub const WS_RTT_LIGHTER: &str = "lt";
 
+/// Arcus WebSocket RTT key.
+pub const WS_RTT_ARCUS: &str = "ar";
+
 static LAST_RTT_MS: LazyLock<DashMap<String, AtomicU64>> = LazyLock::new(DashMap::new);
 static RX_BYTES: LazyLock<DashMap<String, AtomicU64>> = LazyLock::new(DashMap::new);
 

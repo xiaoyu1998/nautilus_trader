@@ -47,7 +47,7 @@ pub struct TxFlowDataClientConfig {
     pub seed_instruments: Vec<InstrumentAny>,
     /// Extra instruments resolvable for `subscribe_trades` (not auto BBO/L2).
     pub trade_instruments: Vec<InstrumentAny>,
-    /// Optional side-channel for maker/taker addresses (strategy maker_db ingest).
+    /// Optional side-channel for maker/taker addresses (strategy trade_db ingest).
     pub trade_tape: Option<Arc<TxFlowTradeTape>>,
 }
 
