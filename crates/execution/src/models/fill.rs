@@ -1462,6 +1462,65 @@ impl FillModel for MarketHoursFillModel {
     }
 }
 
+/// L1 quote touch with unlimited size. A limit fills only when it crosses the
+/// opposite quote. The quote size is not a cap.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.execution", unsendable, from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")
+)]
+pub struct L1TouchFillModel;
+
+impl FillModel for L1TouchFillModel {
+    fn is_limit_filled(&mut self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn is_slipped(&mut self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn get_orderbook_for_fill_simulation(
+        &mut self,
+        instrument: &InstrumentAny,
+        _order: &OrderAny,
+        best_bid: Option<Price>,
+        best_ask: Option<Price>,
+    ) -> anyhow::Result<Option<OrderBook>> {
+        if best_bid.is_none() && best_ask.is_none() {
+            return Ok(None);
+        }
+
+        let mut book = build_l2_book(instrument.id());
+        let size_prec = instrument.size_precision();
+        if let Some(best_bid) = best_bid {
+            add_order(
+                &mut book,
+                instrument,
+                OrderSide::Buy,
+                best_bid,
+                unlimited_liquidity(size_prec),
+                1,
+            );
+        }
+        if let Some(best_ask) = best_ask {
+            add_order(
+                &mut book,
+                instrument,
+                OrderSide::Sell,
+                best_ask,
+                unlimited_liquidity(size_prec),
+                2,
+            );
+        }
+        Ok(Some(book))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum FillModelAny {
     Default(DefaultFillModel),
@@ -1475,6 +1534,7 @@ pub enum FillModelAny {
     CompetitionAware(CompetitionAwareFillModel),
     VolumeSensitive(VolumeSensitiveFillModel),
     MarketHours(MarketHoursFillModel),
+    L1Touch(L1TouchFillModel),
 }
 
 impl FillModel for FillModelAny {
@@ -1491,6 +1551,7 @@ impl FillModel for FillModelAny {
             Self::CompetitionAware(m) => m.is_limit_filled(),
             Self::VolumeSensitive(m) => m.is_limit_filled(),
             Self::MarketHours(m) => m.is_limit_filled(),
+            Self::L1Touch(m) => m.is_limit_filled(),
         }
     }
 
@@ -1507,6 +1568,7 @@ impl FillModel for FillModelAny {
             Self::CompetitionAware(m) => m.fill_limit_inside_spread(),
             Self::VolumeSensitive(m) => m.fill_limit_inside_spread(),
             Self::MarketHours(m) => m.fill_limit_inside_spread(),
+            Self::L1Touch(m) => m.fill_limit_inside_spread(),
         }
     }
 
@@ -1523,6 +1585,7 @@ impl FillModel for FillModelAny {
             Self::CompetitionAware(m) => m.is_slipped(),
             Self::VolumeSensitive(m) => m.is_slipped(),
             Self::MarketHours(m) => m.is_slipped(),
+            Self::L1Touch(m) => m.is_slipped(),
         }
     }
 
@@ -1546,6 +1609,7 @@ impl FillModel for FillModelAny {
             Self::CompetitionAware(m) => m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask),
             Self::VolumeSensitive(m) => m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask),
             Self::MarketHours(m) => m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask),
+            Self::L1Touch(m) => m.get_orderbook_for_fill_simulation(instrument, order, best_bid, best_ask),
         }
     }
 }
@@ -1570,6 +1634,7 @@ impl Display for FillModelAny {
             Self::CompetitionAware(_) => write!(f, "CompetitionAwareFillModel"),
             Self::VolumeSensitive(_) => write!(f, "VolumeSensitiveFillModel"),
             Self::MarketHours(_) => write!(f, "MarketHoursFillModel"),
+            Self::L1Touch(_) => write!(f, "L1TouchFillModel"),
         }
     }
 }

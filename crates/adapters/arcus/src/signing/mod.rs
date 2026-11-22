@@ -1,4 +1,4 @@
-//! Ed25519 request signing (Scheme 1 typed payloads for place/cancel).
+//! Ed25519 request signing (Scheme 1 typed payloads for place/cancel/modify).
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -173,6 +173,44 @@ pub fn cancel_by_id_canonical(
     obj.insert("id".into(), json!(order_id));
     obj.insert("m".into(), json!(market_id));
     obj.insert("op".into(), json!(2));
+    obj.insert("v".into(), json!(1));
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// Scheme 1 modifyOrder. Exactly one of `order_id` or `client_id`.
+#[must_use]
+pub fn modify_canonical(
+    address_lower: &str,
+    account_index: u32,
+    client_id: Option<&str>,
+    order_id: Option<&str>,
+    ct_ns: u64,
+    good_til_ns: u64,
+    market_id: u32,
+    price_ticks: u64,
+    qty_quantums: u64,
+    reduce_only: bool,
+    side_sell: bool,
+    tif: u8,
+) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("ad".into(), json!(address_lower));
+    obj.insert("ai".into(), json!(account_index));
+    if let Some(c) = client_id.filter(|s| !s.is_empty()) {
+        obj.insert("c".into(), json!(c));
+    }
+    obj.insert("ct".into(), json!(ct_ns));
+    obj.insert("g".into(), json!(good_til_ns));
+    if let Some(id) = order_id.filter(|s| !s.is_empty()) {
+        obj.insert("id".into(), json!(id));
+    }
+    obj.insert("m".into(), json!(market_id));
+    obj.insert("op".into(), json!(3));
+    obj.insert("p".into(), json!(price_ticks));
+    obj.insert("q".into(), json!(qty_quantums));
+    obj.insert("r".into(), json!(u8::from(reduce_only)));
+    obj.insert("s".into(), json!(u8::from(side_sell)));
+    obj.insert("t".into(), json!(tif));
     obj.insert("v".into(), json!(1));
     serde_json::Value::Object(obj).to_string()
 }

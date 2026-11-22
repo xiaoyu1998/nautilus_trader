@@ -57,6 +57,24 @@ pub struct PlaceOrderRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModifyOrderRequest {
+    pub address: String,
+    pub account_index: u32,
+    pub market_id: u32,
+    pub quantity: String,
+    pub price: String,
+    pub side: String,
+    pub time_in_force: String,
+    pub reduce_only: bool,
+    pub good_til_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CancelOrderRequest {
     pub address: String,
     pub account_index: u32,

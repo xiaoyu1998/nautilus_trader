@@ -30,9 +30,9 @@ use pyo3::{
 
 use crate::models::fill::{
     BestPriceFillModel, CompetitionAwareFillModel, DefaultFillModel, FillModel, FillModelAny,
-    FillModelHandle, LimitOrderPartialFillModel, MarketHoursFillModel, OneTickSlippageFillModel,
-    ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel, TwoTierFillModel,
-    VolumeSensitiveFillModel,
+    FillModelHandle, L1TouchFillModel, LimitOrderPartialFillModel, MarketHoursFillModel,
+    OneTickSlippageFillModel, ProbabilisticFillModel, SizeAwareFillModel, ThreeTierFillModel,
+    TwoTierFillModel, VolumeSensitiveFillModel,
 };
 
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.execution")]
@@ -200,6 +200,10 @@ pub fn pyobject_to_fill_model_any(obj: &Bound<'_, PyAny>) -> PyResult<FillModelA
         return Ok(FillModelAny::MarketHours(m));
     }
 
+    if let Ok(m) = obj.extract::<L1TouchFillModel>() {
+        return Ok(FillModelAny::L1Touch(m));
+    }
+
     let type_name = obj.get_type().name()?;
     Err(to_pytype_err(format!(
         "Cannot convert {type_name} to FillModel"
@@ -248,6 +252,7 @@ pub fn fill_model_any_to_pyobject(py: Python<'_>, model: &FillModelAny) -> PyRes
         FillModelAny::CompetitionAware(model) => Ok(Py::new(py, model.clone())?.into_any()),
         FillModelAny::VolumeSensitive(model) => Ok(Py::new(py, model.clone())?.into_any()),
         FillModelAny::MarketHours(model) => Ok(Py::new(py, model.clone())?.into_any()),
+        FillModelAny::L1Touch(model) => Ok(Py::new(py, model.clone())?.into_any()),
     }
 }
 
@@ -283,6 +288,19 @@ impl_fill_model_pymethods!(LimitOrderPartialFillModel);
 impl_fill_model_pymethods!(SizeAwareFillModel);
 impl_fill_model_pymethods!(VolumeSensitiveFillModel);
 impl_fill_model_pymethods!(MarketHoursFillModel);
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl L1TouchFillModel {
+    #[new]
+    fn py_new() -> Self {
+        Self
+    }
+
+    fn __repr__(&self) -> String {
+        "L1TouchFillModel".to_string()
+    }
+}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]

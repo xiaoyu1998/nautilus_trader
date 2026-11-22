@@ -8,7 +8,8 @@ use nautilus_network::http::{HttpClient, HttpClientError, Method, create_standar
 use crate::common::enums::ArcusEnvironment;
 use crate::common::urls::rest_base;
 use crate::http::models::{
-    BboRest, CancelOrderRequest, MarketInfo, MarketsResponse, OrderAck, PlaceOrderRequest,
+    BboRest, CancelOrderRequest, MarketInfo, MarketsResponse, ModifyOrderRequest, OrderAck,
+    PlaceOrderRequest,
 };
 use crate::signing::ArcusCredential;
 
@@ -157,6 +158,19 @@ impl ArcusHttpClient {
     ) -> Result<(u16, OrderAck)> {
         let signature = credential.sign_str(canonical);
         self.post_signed_json("/v1/placeOrder", req, credential, &signature, timestamp_ns)
+            .await
+    }
+
+    /// Signed `POST /v1/modifyOrder`.
+    pub async fn modify_order(
+        &self,
+        req: &ModifyOrderRequest,
+        credential: &ArcusCredential,
+        canonical: &str,
+        timestamp_ns: u64,
+    ) -> Result<(u16, OrderAck)> {
+        let signature = credential.sign_str(canonical);
+        self.post_signed_json("/v1/modifyOrder", req, credential, &signature, timestamp_ns)
             .await
     }
 

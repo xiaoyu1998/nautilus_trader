@@ -94,6 +94,7 @@ pub struct OrderUpdate {
     pub size: Option<String>,
     pub remaining_size: Option<String>,
     pub total_filled: Option<String>,
+    pub cancel_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,33 +130,45 @@ struct L2Contents {
     last_sequence_id: Option<u64>,
 }
 
-/// Full L2 snapshot (`l2Orderbook` channel; also initial `subscribed` contents).
+/// L2 book event from `l2OrderbookUpdates` (snapshot on subscribe, then deltas).
 #[derive(Debug, Clone)]
 pub struct L2OrderbookEvent {
     pub market: String,
+    /// Absolute level sizes. On deltas, `size == 0` means delete that price.
     pub bids: Vec<(f64, f64)>,
     pub asks: Vec<(f64, f64)>,
     pub timestamp_us: Option<u64>,
     pub sequence: u64,
+    /// `true` for the initial `subscribed` snapshot; `false` for incremental `channel_data`.
+    pub is_snapshot: bool,
 }
 
 impl L2OrderbookEvent {
     pub fn from_envelope(env: &ChannelEnvelope) -> Option<Self> {
-        if env.channel != "l2Orderbook" {
+        if env.channel != "l2OrderbookUpdates" {
             return None;
         }
-        if env.msg_type != "channel_data" && env.msg_type != "subscribed" {
+        let is_snapshot = env.msg_type == "subscribed";
+        if !is_snapshot && env.msg_type != "channel_data" {
             return None;
         }
         let market = env.id.clone()?;
         let contents: L2Contents = serde_json::from_value(env.contents.clone()?).ok()?;
-        // Skip bad levels; do not abort the whole snapshot on one parse failure.
+        // Skip bad levels; do not abort the whole frame on one parse failure.
         let mut bids = Vec::with_capacity(contents.bids.len());
         for lvl in &contents.bids {
             let Some((px, sz)) = lvl.px_sz() else {
                 continue;
             };
-            if px > 0.0 && sz > 0.0 && px.is_finite() && sz.is_finite() {
+            if !px.is_finite() || !sz.is_finite() || px <= 0.0 {
+                continue;
+            }
+            // Snapshot: only positive sizes. Delta: size 0 deletes the level.
+            if is_snapshot {
+                if sz > 0.0 {
+                    bids.push((px, sz));
+                }
+            } else if sz >= 0.0 {
                 bids.push((px, sz));
             }
         }
@@ -164,11 +177,21 @@ impl L2OrderbookEvent {
             let Some((px, sz)) = lvl.px_sz() else {
                 continue;
             };
-            if px > 0.0 && sz > 0.0 && px.is_finite() && sz.is_finite() {
+            if !px.is_finite() || !sz.is_finite() || px <= 0.0 {
+                continue;
+            }
+            if is_snapshot {
+                if sz > 0.0 {
+                    asks.push((px, sz));
+                }
+            } else if sz >= 0.0 {
                 asks.push((px, sz));
             }
         }
-        if bids.is_empty() && asks.is_empty() {
+        if is_snapshot && bids.is_empty() && asks.is_empty() {
+            return None;
+        }
+        if !is_snapshot && bids.is_empty() && asks.is_empty() {
             return None;
         }
         Some(Self {
@@ -177,6 +200,7 @@ impl L2OrderbookEvent {
             asks,
             timestamp_us: contents.timestamp,
             sequence: contents.last_sequence_id.unwrap_or(0),
+            is_snapshot,
         })
     }
 }

@@ -1,7 +1,7 @@
-//! Arcus execution client MVP: REST place/cancel + WS orders/userFills.
+//! Arcus execution client: REST place/cancel/modify + WS orders/userFills.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use nautilus_common::{
     clients::ExecutionClient,
     live::try_get_exec_event_sender,
-    messages::execution::{CancelOrder, SubmitOrder},
+    messages::execution::{CancelOrder, ModifyOrder, SubmitOrder},
 };
 use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
@@ -33,11 +33,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     common::{consts::ARCUS_VENUE, enums::ArcusEnvironment},
     config::ArcusExecutionClientConfig,
-    http::{ArcusHttpClient, CancelOrderRequest, PlaceOrderRequest},
+    http::{ArcusHttpClient, CancelOrderRequest, ModifyOrderRequest, PlaceOrderRequest},
     providers::{ticker_from_instrument_id, MarketMeta},
     signing::{
-        cancel_by_client_canonical, cancel_by_id_canonical, parse_decimal, place_canonical,
-        tif_code, ArcusCredential,
+        cancel_by_client_canonical, cancel_by_id_canonical, modify_canonical, parse_decimal,
+        place_canonical, tif_code, ArcusCredential,
     },
     websocket::{AccountEvent, ArcusWsClient},
 };
@@ -56,6 +56,8 @@ pub struct ArcusExecutionClient {
     order_markets: Arc<Mutex<HashMap<ClientOrderId, String>>>,
     /// Inflight orders for WS lifecycle (Send-safe; avoids capturing Cache).
     inflight: Arc<Mutex<HashMap<ClientOrderId, OrderAny>>>,
+    /// Modify sent; the next `CANCELED` / `MODIFY_CANCELED` is not a real cancel.
+    pending_modify: Arc<Mutex<HashSet<ClientOrderId>>>,
     cancellation_token: CancellationToken,
     session_tasks: TaskGroup,
     started: AtomicBool,
@@ -101,6 +103,7 @@ impl ArcusExecutionClient {
             markets: Arc::new(Mutex::new(HashMap::new())),
             order_markets: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
+            pending_modify: Arc::new(Mutex::new(HashSet::new())),
             cancellation_token: CancellationToken::new(),
             session_tasks: TaskGroup::new(),
             started: AtomicBool::new(false),
@@ -165,6 +168,7 @@ impl ArcusExecutionClient {
         let cancel = self.cancellation_token.clone();
         let emitter = self.emitter.clone();
         let inflight = Arc::clone(&self.inflight);
+        let pending_modify = Arc::clone(&self.pending_modify);
         let clock = self.clock;
 
         self.session_tasks
@@ -203,7 +207,7 @@ impl ArcusExecutionClient {
                         }
                         ev = rx.recv() => {
                             let Some(ev) = ev else { break; };
-                            handle_account_event(&inflight, &emitter, clock, ev);
+                            handle_account_event(&inflight, &pending_modify, &emitter, clock, ev);
                         }
                     }
                 }
@@ -215,6 +219,7 @@ impl ArcusExecutionClient {
 
 fn handle_account_event(
     inflight: &Mutex<HashMap<ClientOrderId, OrderAny>>,
+    pending_modify: &Mutex<HashSet<ClientOrderId>>,
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
     ev: AccountEvent,
@@ -234,27 +239,62 @@ fn handle_account_event(
             };
             let status = o.status.as_deref().unwrap_or("").to_ascii_uppercase();
             let ts = clock.get_time_ns();
+            let modify_cancel = o
+                .cancel_reason
+                .as_deref()
+                .is_some_and(|r| r.eq_ignore_ascii_case("MODIFY_CANCELED"));
             match status.as_str() {
                 "OPEN" | "BEST_EFFORT_OPENED" | "ACK" => {
-                    if let Some(id) = o.id.as_deref() {
-                        emitter.emit_order_accepted(&order, VenueOrderId::from(id), ts);
+                    let Some(id) = o.id.as_deref() else {
+                        return;
+                    };
+                    let vid = VenueOrderId::from(id);
+                    let awaiting = pending_modify.lock().unwrap().remove(&cid);
+                    if awaiting {
+                        let qty = o
+                            .size
+                            .as_deref()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .filter(|q| *q > 0.0)
+                            .map(|q| Quantity::new(q, order.quantity().precision))
+                            .unwrap_or_else(|| order.quantity());
+                        let price = o
+                            .price
+                            .as_deref()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .filter(|p| *p > 0.0)
+                            .map(|p| Price::new(p, order.price().map(|px| px.precision).unwrap_or(8)));
+                        emitter.emit_order_updated(&order, vid, qty, price, None, None, ts);
+                    } else {
+                        emitter.emit_order_accepted(&order, vid, ts);
                     }
                 }
+                "CANCELED" | "CANCELLED" if modify_cancel => {
+                    pending_modify.lock().unwrap().insert(cid);
+                }
                 "CANCELED" | "CANCELLED" => {
+                    pending_modify.lock().unwrap().remove(&cid);
                     let vid = o.id.as_deref().map(VenueOrderId::from);
                     emitter.emit_order_canceled(&order, vid, ts);
                     inflight.lock().unwrap().remove(&cid);
                 }
                 "REJECTED" | "EXPIRED" => {
-                    emitter.emit_order_rejected(
-                        &order,
-                        &format!("Arcus status={status}"),
-                        ts,
-                        false,
-                    );
+                    let awaiting = pending_modify.lock().unwrap().remove(&cid);
+                    if awaiting {
+                        let vid = o.id.as_deref().map(VenueOrderId::from);
+                        emitter.emit_order_canceled(&order, vid, ts);
+                    } else {
+                        emitter.emit_order_rejected(
+                            &order,
+                            &format!("Arcus status={status}"),
+                            ts,
+                            false,
+                        );
+                    }
                     inflight.lock().unwrap().remove(&cid);
                 }
                 "FILLED" => {
+                    pending_modify.lock().unwrap().remove(&cid);
                     inflight.lock().unwrap().remove(&cid);
                 }
                 _ => {}
@@ -644,6 +684,194 @@ impl ExecutionClient for ArcusExecutionClient {
                         &format!("Arcus cancel failed: {e:#}"),
                         get_atomic_clock_realtime().get_time_ns(),
                     );
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        let Some(credential) = self.credential.clone() else {
+            anyhow::bail!("Arcus modify_order requires credentials");
+        };
+        let order = self.core.get_order(&cmd.client_order_id)?;
+        let reject = |reason: &str| {
+            self.emitter.emit_order_modify_rejected(
+                &order,
+                order.venue_order_id(),
+                reason,
+                self.clock.get_time_ns(),
+            );
+        };
+        if order.is_closed() {
+            reject("Arcus modify on closed order");
+            return Ok(());
+        }
+        if cmd.trigger_price.is_some() {
+            reject("Arcus modify does not support trigger price");
+            return Ok(());
+        }
+        if cmd.price.is_none() && cmd.quantity.is_none() {
+            reject("Arcus modify needs a new price or quantity");
+            return Ok(());
+        }
+        let price = match cmd.price.or_else(|| order.price()) {
+            Some(p) => p,
+            None => {
+                reject("Arcus modify needs a limit price");
+                return Ok(());
+            }
+        };
+        let qty = cmd.quantity.unwrap_or_else(|| order.quantity());
+        let meta = match self.market_for_order(&order) {
+            Ok(m) => m,
+            Err(e) => {
+                reject(&format!("Arcus market: {e}"));
+                return Ok(());
+            }
+        };
+        let Ok(price_dec) = parse_decimal(&price.to_string()) else {
+            reject("bad price decimal");
+            return Ok(());
+        };
+        let Ok(qty_dec) = parse_decimal(&qty.to_string()) else {
+            reject("bad qty decimal");
+            return Ok(());
+        };
+        let price_ticks = match meta.price_ticks(price_dec) {
+            Ok(v) => v,
+            Err(e) => {
+                reject(&format!("price ticks: {e}"));
+                return Ok(());
+            }
+        };
+        let qty_q = match meta.qty_quantums(qty_dec) {
+            Ok(v) => v,
+            Err(e) => {
+                reject(&format!("qty quantums: {e}"));
+                return Ok(());
+            }
+        };
+        let address = match self.config.resolved_address() {
+            Ok(a) => a,
+            Err(e) => {
+                reject(&e.to_string());
+                return Ok(());
+            }
+        };
+        let account_index = self.config.resolved_account_index();
+        let (tif_name, tif) = Self::map_tif(&order);
+        let side_sell = order.order_side() == OrderSide::Sell;
+        let client_id = order.client_order_id().to_string();
+        let venue_id = cmd
+            .venue_order_id
+            .map(|id| id.to_string())
+            .or_else(|| order.venue_order_id().map(|id| id.to_string()));
+        let ct = self.now_ns();
+        let gtt_us = self.good_til_time_us();
+        let g_ns = gtt_us.saturating_mul(1_000);
+        let canonical = if let Some(id) = venue_id.as_deref() {
+            modify_canonical(
+                &address,
+                account_index,
+                None,
+                Some(id),
+                ct,
+                g_ns,
+                meta.market_id,
+                price_ticks,
+                qty_q,
+                order.is_reduce_only(),
+                side_sell,
+                tif,
+            )
+        } else {
+            modify_canonical(
+                &address,
+                account_index,
+                Some(&client_id),
+                None,
+                ct,
+                g_ns,
+                meta.market_id,
+                price_ticks,
+                qty_q,
+                order.is_reduce_only(),
+                side_sell,
+                tif,
+            )
+        };
+        let by_venue = venue_id.is_some();
+        let req = ModifyOrderRequest {
+            address,
+            account_index,
+            market_id: meta.market_id,
+            quantity: qty_dec.normalize().to_string(),
+            price: price_dec.normalize().to_string(),
+            side: if side_sell {
+                "SELL".into()
+            } else {
+                "BUY".into()
+            },
+            time_in_force: tif_name.into(),
+            reduce_only: order.is_reduce_only(),
+            good_til_time: gtt_us.to_string(),
+            order_id: venue_id,
+            client_id: if by_venue {
+                None
+            } else {
+                Some(client_id)
+            },
+        };
+
+        let http = self.http.clone();
+        let emitter = self.emitter.clone();
+        let order_for_task = order.clone();
+        let pending = Arc::clone(&self.pending_modify);
+        let inflight = Arc::clone(&self.inflight);
+        let cancel = self.cancellation_token.clone();
+        let cid = order.client_order_id();
+        let _ = self.session_tasks.spawn(async move {
+            if cancel.is_cancelled() {
+                return;
+            }
+            match http
+                .modify_order(&req, &credential, &canonical, ct)
+                .await
+            {
+                Ok((status, ack)) => {
+                    log::info!(
+                        "Arcus modifyOrder http={status} orderId={:?} clientId={:?} status={:?}",
+                        ack.order_id,
+                        ack.client_id,
+                        ack.status
+                    );
+                    let st = ack.status.as_deref().unwrap_or("").to_ascii_uppercase();
+                    if st == "REJECTED" || st == "EXPIRED" {
+                        pending.lock().unwrap().remove(&cid);
+                        let vid = ack
+                            .order_id
+                            .as_deref()
+                            .map(VenueOrderId::from)
+                            .or_else(|| order_for_task.venue_order_id());
+                        emitter.emit_order_canceled(
+                            &order_for_task,
+                            vid,
+                            get_atomic_clock_realtime().get_time_ns(),
+                        );
+                        inflight.lock().unwrap().remove(&cid);
+                    }
+                }
+                Err(e) => {
+                    let engine_saw_it = pending.lock().unwrap().contains(&cid);
+                    if !engine_saw_it {
+                        emitter.emit_order_modify_rejected(
+                            &order_for_task,
+                            order_for_task.venue_order_id(),
+                            &format!("Arcus modifyOrder failed: {e:#}"),
+                            get_atomic_clock_realtime().get_time_ns(),
+                        );
+                    }
                 }
             }
         });

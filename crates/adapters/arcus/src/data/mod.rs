@@ -1,4 +1,4 @@
-//! Arcus live [`DataClient`]: WS `bbo` → [`QuoteTick`], `l2Orderbook` → [`OrderBookDeltas`].
+//! Arcus live [`DataClient`]: WS `bbo` → [`QuoteTick`], `l2OrderbookUpdates` → [`OrderBookDeltas`].
 //!
 //! Market data uses one multiplexed WebSocket (hub) for all BBO + L2 subscriptions so inbound
 //! bytes are counted once under [`WS_RTT_ARCUS`] and we avoid per-market connection limits.
@@ -33,6 +33,7 @@ use nautilus_model::{
     data::{BookOrder, Data, OrderBookDelta, OrderBookDeltas, QuoteTick},
     enums::{BookAction, BookType, OrderSide, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
+    instruments::Instrument,
     types::{Price, Quantity},
 };
 use nautilus_network::websocket::WS_RTT_ARCUS;
@@ -51,7 +52,7 @@ use crate::{
     },
 };
 
-/// Live data client: multiplexed Arcus BBO + L2 snapshot subscriptions.
+/// Live data client: multiplexed Arcus BBO + L2 incremental book subscriptions.
 #[derive(Debug)]
 pub struct ArcusDataClient {
     clock: &'static AtomicTime,
@@ -61,10 +62,10 @@ pub struct ArcusDataClient {
     data_sender: EventSender<DataEvent>,
     cancellation_token: CancellationToken,
     session_tasks: TaskGroup,
-    /// ticker (ZEC-USD) → instrument id (quotes)
-    subscribed: Arc<Mutex<HashMap<String, InstrumentId>>>,
-    /// ticker → instrument id (L2 book)
-    subscribed_books: Arc<Mutex<HashMap<String, (InstrumentId, u32)>>>,
+    /// ticker (ZEC-USD) → quote subscription
+    subscribed: Arc<Mutex<HashMap<String, QuoteSub>>>,
+    /// ticker → L2 subscription
+    subscribed_books: Arc<Mutex<HashMap<String, BookSub>>>,
     market_cmd_tx: Option<mpsc::UnboundedSender<ArcusMarketCmd>>,
 }
 
@@ -99,6 +100,15 @@ impl ArcusDataClient {
         }
     }
 
+    fn precisions(&self, instrument_id: &InstrumentId) -> (u8, u8) {
+        self.config
+            .seed_instruments
+            .iter()
+            .find(|inst| inst.id() == *instrument_id)
+            .map(|inst| (inst.price_precision(), inst.size_precision()))
+            .unwrap_or((ARCUS_PRICE_PRECISION, ARCUS_SIZE_PRECISION))
+    }
+
     fn send_market_cmd(&self, cmd: ArcusMarketCmd) {
         if let Some(tx) = &self.market_cmd_tx
             && tx.send(cmd).is_err()
@@ -113,6 +123,7 @@ impl ArcusDataClient {
         }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::channel::<ArcusMarketEvent>(4096);
+        let cmd_tx_events = cmd_tx.clone();
         self.market_cmd_tx = Some(cmd_tx);
 
         let cancel = self.cancellation_token.clone();
@@ -147,7 +158,17 @@ impl ArcusDataClient {
                                     publish_bbo(&ev, &subscribed, &data_sender, clock);
                                 }
                                 ArcusMarketEvent::L2(ev) => {
-                                    publish_l2(&ev, &subscribed_books, &data_sender, clock);
+                                    if let Some((market, n_levels)) =
+                                        publish_l2(&ev, &subscribed_books, &data_sender, clock)
+                                    {
+                                        let _ = cmd_tx_events.send(ArcusMarketCmd::UnsubL2 {
+                                            market: market.clone(),
+                                        });
+                                        let _ = cmd_tx_events.send(ArcusMarketCmd::SubL2 {
+                                            market,
+                                            n_levels,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -157,7 +178,7 @@ impl ArcusDataClient {
             .map_err(|e| anyhow::anyhow!("spawn Arcus market hub: {e}"))?;
 
         log::info!(
-            "Arcus market hub started (rtt_key={WS_RTT_ARCUS}, multiplexed BBO+L2)"
+            "Arcus market hub started (rtt_key={WS_RTT_ARCUS}, multiplexed BBO+L2 updates)"
         );
         Ok(())
     }
@@ -172,7 +193,7 @@ impl ArcusDataClient {
             .lock()
             .unwrap()
             .iter()
-            .map(|(m, (_, n))| (m.clone(), *n))
+            .map(|(m, sub)| (m.clone(), sub.n_levels))
             .collect();
         for (market, n_levels) in books {
             self.send_market_cmd(ArcusMarketCmd::SubL2 { market, n_levels });
@@ -182,25 +203,25 @@ impl ArcusDataClient {
 
 fn publish_bbo(
     ev: &BboEvent,
-    subscribed: &Mutex<HashMap<String, InstrumentId>>,
+    subscribed: &Mutex<HashMap<String, QuoteSub>>,
     data_sender: &EventSender<DataEvent>,
     clock: &'static AtomicTime,
 ) {
-    let instrument_id = {
+    let sub = {
         let guard = subscribed.lock().unwrap();
         match guard.get(&ev.market).copied() {
-            Some(id) => id,
+            Some(sub) => sub,
             None => return,
         }
     };
     let ts_event = UnixNanos::from(ev.timestamp_us.unwrap_or(0).saturating_mul(1_000));
     let ts_init = clock.get_time_ns();
     let quote = QuoteTick::new(
-        instrument_id,
-        Price::new(ev.bid_px, ARCUS_PRICE_PRECISION),
-        Price::new(ev.ask_px, ARCUS_PRICE_PRECISION),
-        Quantity::new(ev.bid_sz.max(0.0), ARCUS_SIZE_PRECISION),
-        Quantity::new(ev.ask_sz.max(0.0), ARCUS_SIZE_PRECISION),
+        sub.instrument_id,
+        Price::new(ev.bid_px, sub.price_precision),
+        Price::new(ev.ask_px, sub.price_precision),
+        Quantity::new(ev.bid_sz.max(0.0), sub.size_precision),
+        Quantity::new(ev.ask_sz.max(0.0), sub.size_precision),
         ts_event,
         ts_init,
     );
@@ -209,82 +230,155 @@ fn publish_bbo(
     }
 }
 
+/// Publish L2 event. Returns `Some((market, n_levels))` when a sequence gap needs resubscribe.
 fn publish_l2(
     ev: &L2OrderbookEvent,
-    subscribed_books: &Mutex<HashMap<String, (InstrumentId, u32)>>,
+    subscribed_books: &Mutex<HashMap<String, BookSub>>,
     data_sender: &EventSender<DataEvent>,
     clock: &'static AtomicTime,
-) {
-    let instrument_id = {
-        let guard = subscribed_books.lock().unwrap();
-        match guard.get(&ev.market).map(|(id, _)| *id) {
-            Some(id) => id,
-            None => return,
+) -> Option<(String, u32)> {
+    let sub = {
+        let mut guard = subscribed_books.lock().unwrap();
+        let Some(sub) = guard.get_mut(&ev.market) else {
+            return None;
+        };
+        if !ev.is_snapshot {
+            if sub.last_seq == 0 {
+                log::debug!(
+                    "Arcus L2 skip delta before snapshot market={} seq={}",
+                    ev.market,
+                    ev.sequence
+                );
+                return None;
+            }
+            if ev.sequence != sub.last_seq.saturating_add(1) {
+                log::warn!(
+                    "Arcus L2 sequence gap market={} last={} got={} — resubscribe",
+                    ev.market,
+                    sub.last_seq,
+                    ev.sequence
+                );
+                sub.last_seq = 0;
+                return Some((ev.market.clone(), sub.n_levels));
+            }
         }
+        let snap = *sub;
+        sub.last_seq = ev.sequence;
+        snap
     };
     let ts_init = clock.get_time_ns();
-    match snapshot_to_deltas(ev, instrument_id, ts_init) {
+    match event_to_deltas(ev, sub, ts_init) {
         Ok(deltas) => {
             if let Err(e) = data_sender.send(DataEvent::Data(Data::BookDeltas(Box::new(deltas)))) {
                 log::warn!("Arcus failed to publish book: {e}");
             }
         }
-        Err(e) => log::warn!("Arcus L2 parse {instrument_id}: {e:#}"),
+        Err(e) => log::warn!("Arcus L2 parse {}: {e:#}", sub.instrument_id),
     }
+    None
 }
 
-fn snapshot_to_deltas(
+fn event_to_deltas(
     ev: &L2OrderbookEvent,
-    instrument_id: InstrumentId,
+    sub: BookSub,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDeltas> {
-    // Arcus `l2Orderbook` is full-replace (~200ms). Always Clear then Add.
     // L2_MBP rewrites order_id to a price hash in pre_process_order; pass 0 here.
+    let instrument_id = sub.instrument_id;
     let ts_event = UnixNanos::from(ev.timestamp_us.unwrap_or(0).saturating_mul(1_000));
     let seq = ev.sequence;
-    let mut deltas = Vec::with_capacity(1 + ev.bids.len() + ev.asks.len());
-    deltas.push(OrderBookDelta::clear(instrument_id, seq, ts_event, ts_init));
 
-    for (px, sz) in &ev.bids {
-        let price = Price::new(*px, ARCUS_PRICE_PRECISION);
-        let order = BookOrder::new(
-            OrderSide::Buy,
-            price,
-            Quantity::new(*sz, ARCUS_SIZE_PRECISION),
-            0,
-        );
+    if ev.is_snapshot {
+        let mut deltas = Vec::with_capacity(1 + ev.bids.len() + ev.asks.len());
+        deltas.push(OrderBookDelta::clear(instrument_id, seq, ts_event, ts_init));
+        for (px, sz) in &ev.bids {
+            let order = BookOrder::new(
+                OrderSide::Buy,
+                Price::new(*px, sub.price_precision),
+                Quantity::new(*sz, sub.size_precision),
+                0,
+            );
+            deltas.push(OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                order,
+                RecordFlag::F_SNAPSHOT as u8,
+                seq,
+                ts_event,
+                ts_init,
+            ));
+        }
+        for (px, sz) in &ev.asks {
+            let order = BookOrder::new(
+                OrderSide::Sell,
+                Price::new(*px, sub.price_precision),
+                Quantity::new(*sz, sub.size_precision),
+                0,
+            );
+            deltas.push(OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                order,
+                RecordFlag::F_SNAPSHOT as u8,
+                seq,
+                ts_event,
+                ts_init,
+            ));
+        }
+        if let Some(last) = deltas.last_mut() {
+            last.flags |= RecordFlag::F_LAST as u8;
+        }
+        return Ok(OrderBookDeltas::new(instrument_id, deltas));
+    }
+
+    // Incremental: absolute sizes; size 0 deletes the level.
+    let mut deltas = Vec::with_capacity(ev.bids.len() + ev.asks.len());
+    let push_level = |deltas: &mut Vec<OrderBookDelta>, side: OrderSide, px: f64, sz: f64| {
+        let price = Price::new(px, sub.price_precision);
+        let size = Quantity::new(sz.max(0.0), sub.size_precision);
+        let action = if size.is_zero() {
+            BookAction::Delete
+        } else {
+            BookAction::Update
+        };
+        let order = BookOrder::new(side, price, size, 0);
         deltas.push(OrderBookDelta::new(
             instrument_id,
-            BookAction::Add,
+            action,
             order,
-            RecordFlag::F_SNAPSHOT as u8,
+            0,
             seq,
             ts_event,
             ts_init,
         ));
+    };
+    for (px, sz) in &ev.bids {
+        push_level(&mut deltas, OrderSide::Buy, *px, *sz);
     }
     for (px, sz) in &ev.asks {
-        let price = Price::new(*px, ARCUS_PRICE_PRECISION);
-        let order = BookOrder::new(
-            OrderSide::Sell,
-            price,
-            Quantity::new(*sz, ARCUS_SIZE_PRECISION),
-            0,
-        );
-        deltas.push(OrderBookDelta::new(
-            instrument_id,
-            BookAction::Add,
-            order,
-            RecordFlag::F_SNAPSHOT as u8,
-            seq,
-            ts_event,
-            ts_init,
-        ));
+        push_level(&mut deltas, OrderSide::Sell, *px, *sz);
     }
     if let Some(last) = deltas.last_mut() {
         last.flags |= RecordFlag::F_LAST as u8;
     }
     Ok(OrderBookDeltas::new(instrument_id, deltas))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuoteSub {
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BookSub {
+    instrument_id: InstrumentId,
+    n_levels: u32,
+    price_precision: u8,
+    size_precision: u8,
+    /// Last applied `lastSequenceId` (0 = awaiting snapshot).
+    last_seq: u64,
 }
 
 fn clamp_n_levels(depth: Option<NonZeroUsize>) -> u32 {
@@ -367,10 +461,15 @@ impl DataClient for ArcusDataClient {
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
             let ticker = ticker_from_instrument_id(&instrument_id)?;
-            self.subscribed
-                .lock()
-                .unwrap()
-                .insert(ticker.clone(), instrument_id);
+            let (price_precision, size_precision) = self.precisions(&instrument_id);
+            self.subscribed.lock().unwrap().insert(
+                ticker.clone(),
+                QuoteSub {
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                },
+            );
             log::info!("Arcus subscribe_quotes ticker={ticker} instrument={instrument_id}");
             if self.is_connected() {
                 self.send_market_cmd(ArcusMarketCmd::SubBbo { market: ticker });
@@ -403,12 +502,19 @@ impl DataClient for ArcusDataClient {
         let n_levels = clamp_n_levels(cmd.depth);
         execute_instrument_subscriptions(&cmd.instrument_ids, |instrument_id| {
             let ticker = ticker_from_instrument_id(&instrument_id)?;
-            self.subscribed_books
-                .lock()
-                .unwrap()
-                .insert(ticker.clone(), (instrument_id, n_levels));
+            let (price_precision, size_precision) = self.precisions(&instrument_id);
+            self.subscribed_books.lock().unwrap().insert(
+                ticker.clone(),
+                BookSub {
+                    instrument_id,
+                    n_levels,
+                    price_precision,
+                    size_precision,
+                    last_seq: 0,
+                },
+            );
             log::info!(
-                "Arcus subscribe_book_deltas ticker={ticker} instrument={instrument_id} nLevels={n_levels}"
+                "Arcus subscribe_book_deltas (l2OrderbookUpdates) ticker={ticker} instrument={instrument_id} nLevels={n_levels}"
             );
             if self.is_connected() {
                 self.send_market_cmd(ArcusMarketCmd::SubL2 {

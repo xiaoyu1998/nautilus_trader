@@ -4,11 +4,11 @@ Arcus perpetual futures adapter for Nautilus Trader (MVP).
 
 ## Scope
 
-- **Data**: REST `GET /v1/markets`, `GET /v1/bbo`; WS `bbo` → `QuoteTick`; WS `l2Orderbook` → `OrderBookDeltas` (full snapshots)
-- **Execution**: Ed25519-signed REST `placeOrder` / `cancelOrder`; WS `orders` + `userFills` for lifecycle
+- **Data**: REST `GET /v1/markets`, `GET /v1/bbo`; WS `bbo` → `QuoteTick`; WS `l2OrderbookUpdates` → `OrderBookDeltas` (snapshot + incremental deltas)
+- **Execution**: Ed25519-signed REST `placeOrder` / `cancelOrder` / `modifyOrder`; WS `orders` + `userFills` for lifecycle
 - Instrument ids: `{TICKER}-PERP.ARCUS` (e.g. `ZEC-USD-PERP.ARCUS`)
 
-Not in this MVP: incremental `l2OrderbookUpdates`, modify-order, mass status / full reconciliation.
+Not in this MVP: mass status / full reconciliation. Sequence gaps on the book stream trigger unsubscribe+resubscribe.
 
 ## Smoke bins
 

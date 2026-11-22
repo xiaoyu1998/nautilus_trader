@@ -113,7 +113,7 @@ impl ArcusWsClient {
         Ok(())
     }
 
-    /// Stream full L2 snapshots for one market (`l2Orderbook`, ~200ms).
+    /// Stream L2 snapshot + incremental deltas (`l2OrderbookUpdates`).
     pub async fn stream_l2_orderbook(
         environment: ArcusEnvironment,
         market: &str,
@@ -122,20 +122,22 @@ impl ArcusWsClient {
     ) -> Result<()> {
         let url = ws_url(environment);
         let n_levels = n_levels.clamp(1, 100);
-        log::info!("Arcus WS L2 connect {url} market={market} nLevels={n_levels}");
+        log::info!(
+            "Arcus WS L2 updates connect {url} market={market} nLevels={n_levels}"
+        );
         let ws = connect_ws(url).await?;
         let (mut write, mut read) = ws.split();
 
         let sub = json!({
             "type": "subscribe",
-            "channel": "l2Orderbook",
+            "channel": "l2OrderbookUpdates",
             "id": market,
             "nLevels": n_levels,
         });
         write
             .send(Message::Text(sub.to_string().into()))
             .await
-            .context("send l2Orderbook subscribe")?;
+            .context("send l2OrderbookUpdates subscribe")?;
 
         let mut ping = tokio::time::interval(Duration::from_secs(20));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -239,7 +241,7 @@ impl ArcusWsClient {
             for (market, n_levels) in &l2 {
                 let sub = json!({
                     "type": "subscribe",
-                    "channel": "l2Orderbook",
+                    "channel": "l2OrderbookUpdates",
                     "id": market,
                     "nLevels": *n_levels,
                 });
@@ -291,7 +293,7 @@ impl ArcusWsClient {
                             ArcusMarketCmd::SubL2 { market, n_levels } => {
                                 let sub = json!({
                                     "type": "subscribe",
-                                    "channel": "l2Orderbook",
+                                    "channel": "l2OrderbookUpdates",
                                     "id": market,
                                     "nLevels": n_levels,
                                 });
@@ -302,7 +304,7 @@ impl ArcusWsClient {
                             ArcusMarketCmd::UnsubL2 { market } => {
                                 let sub = json!({
                                     "type": "unsubscribe",
-                                    "channel": "l2Orderbook",
+                                    "channel": "l2OrderbookUpdates",
                                     "id": market,
                                 });
                                 let _ = write.send(Message::Text(sub.to_string().into())).await;
