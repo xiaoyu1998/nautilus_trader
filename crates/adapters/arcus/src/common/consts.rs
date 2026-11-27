@@ -1,9 +1,17 @@
 //! Venue / client identifiers for the Arcus adapter.
 
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use nautilus_model::identifiers::{ClientId, Venue};
 use ustr::Ustr;
+
+/// Match Lighter market-data heartbeat (empty WS Ping → Pong RTT).
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Three heartbeat cycles without any frame → tear down (same ratio as Lighter).
+pub const HEARTBEAT_TIMEOUT: Duration =
+    Duration::from_secs(HEARTBEAT_INTERVAL.as_secs().saturating_mul(3));
 
 /// Venue identifier string.
 pub const ARCUS: &str = "ARCUS";

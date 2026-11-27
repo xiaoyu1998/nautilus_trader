@@ -45,21 +45,38 @@ pub const WS_RTT_LIGHTER: &str = "lt";
 /// Arcus WebSocket RTT key.
 pub const WS_RTT_ARCUS: &str = "ar";
 
-static LAST_RTT_MS: LazyLock<DashMap<String, AtomicU64>> = LazyLock::new(DashMap::new);
+/// Last RTT samples stored as **microseconds** (display as ms with decimals).
+static LAST_RTT_US: LazyLock<DashMap<String, AtomicU64>> = LazyLock::new(DashMap::new);
 static RX_BYTES: LazyLock<DashMap<String, AtomicU64>> = LazyLock::new(DashMap::new);
 
-/// Stores the last observed ping→pong RTT in milliseconds for `key`.
-pub fn record_rtt_ms(key: &str, ms: u64) {
-    LAST_RTT_MS
+/// Stores the last observed ping→pong RTT in microseconds for `key`.
+pub fn record_rtt_us(key: &str, us: u64) {
+    LAST_RTT_US
         .entry(key.to_string())
         .or_insert_with(|| AtomicU64::new(0))
-        .store(ms, Ordering::Relaxed);
+        .store(us, Ordering::Relaxed);
 }
 
-/// Returns the last RTT in milliseconds for `key`, if any sample has been recorded.
+/// Stores the last observed ping→pong RTT in whole milliseconds for `key`.
+pub fn record_rtt_ms(key: &str, ms: u64) {
+    record_rtt_us(key, ms.saturating_mul(1_000));
+}
+
+/// Returns the last RTT in whole milliseconds for `key` (truncated).
 #[must_use]
 pub fn last_rtt_ms(key: &str) -> Option<u64> {
-    LAST_RTT_MS
+    last_rtt_us(key).map(|us| us / 1_000)
+}
+
+/// Returns the last RTT in milliseconds (fractional) for `key`.
+#[must_use]
+pub fn last_rtt_ms_f64(key: &str) -> Option<f64> {
+    last_rtt_us(key).map(|us| us as f64 / 1_000.0)
+}
+
+#[must_use]
+fn last_rtt_us(key: &str) -> Option<u64> {
+    LAST_RTT_US
         .get(key)
         .map(|v| v.load(Ordering::Relaxed))
 }
@@ -126,8 +143,8 @@ impl RttProbe {
         let Some(sent) = self.ping_sent.lock().take() else {
             return;
         };
-        let ms = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX);
-        record_rtt_ms(&key, ms);
+        let us = u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX);
+        record_rtt_us(&key, us);
     }
 
     /// Accumulates inbound Text/Binary payload bytes when a venue key is set.

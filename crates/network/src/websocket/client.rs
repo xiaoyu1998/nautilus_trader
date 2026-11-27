@@ -280,6 +280,7 @@ impl WebSocketClientInner {
         let (writer_tx, writer_rx) = crate::writer::channel::<WriterCommand>(
             config.writer_capacity.unwrap_or(DEFAULT_WRITER_CAPACITY),
         );
+        let rtt = Arc::new(RttProbe::new());
         let write_task = Self::spawn_write_task(
             Arc::clone(&connection_mode),
             Arc::clone(&controller_notify),
@@ -290,16 +291,15 @@ impl WebSocketClientInner {
             Arc::clone(&auth_tracker),
             Arc::clone(&reconnect_buffer_waits_for_auth),
             state_sink.clone(),
+            Some(Arc::clone(&rtt)),
         );
 
-        let rtt = Arc::new(RttProbe::new());
         let heartbeat_task = config.heartbeat_interval_secs.map(|heartbeat_interval| {
             Self::spawn_heartbeat_task(
                 Arc::clone(&connection_mode),
                 heartbeat_interval,
                 config.heartbeat_payload.clone(),
                 writer_tx.clone(),
-                Arc::clone(&rtt),
             )
         });
 
@@ -544,6 +544,7 @@ impl WebSocketClientInner {
             Arc::clone(&auth_tracker),
             Arc::clone(&reconnect_buffer_waits_for_auth),
             state_sink.clone(),
+            Some(Arc::clone(&rtt)),
         );
 
         // Optionally spawn a heartbeat task to periodically ping server
@@ -553,7 +554,6 @@ impl WebSocketClientInner {
                 heartbeat_secs,
                 config.heartbeat_payload.clone(),
                 writer_tx.clone(),
-                Arc::clone(&rtt),
             )
         });
 
@@ -1990,6 +1990,7 @@ impl WebSocketClientInner {
         auth_tracker: Arc<OnceLock<AuthTracker>>,
         reconnect_buffer_waits_for_auth: Arc<AtomicBool>,
         state_sink: Option<SocketStateSink>,
+        rtt: Option<SharedRttProbe>,
     ) -> dst::task::JoinHandle<()> {
         log_task_started("write");
 
@@ -2266,6 +2267,12 @@ impl WebSocketClientInner {
                                 }
                             }
                             WriterCommand::Heartbeat(msg) => {
+                                // Stamp after dequeue so RTT excludes writer-channel wait.
+                                if matches!(msg, Message::Ping(_))
+                                    && let Some(ref rtt) = rtt
+                                {
+                                    rtt.mark_ping_sent();
+                                }
                                 let send_failed =
                                     Self::write_outbound(&mut active_writer, msg).await;
 
@@ -2334,7 +2341,6 @@ impl WebSocketClientInner {
         heartbeat_secs: u64,
         message: Option<String>,
         writer_tx: WriterSender<WriterCommand>,
-        rtt: SharedRttProbe,
     ) -> dst::task::JoinHandle<()> {
         log_task_started("heartbeat");
 
@@ -2349,10 +2355,8 @@ impl WebSocketClientInner {
                             Some(text) => {
                                 WriterCommand::Heartbeat(Message::Text(text.clone().into()))
                             }
-                            None => {
-                                rtt.mark_ping_sent();
-                                WriterCommand::Heartbeat(Message::Ping(vec![].into()))
-                            }
+                            // Ping timestamp is applied in the writer when the frame is sent.
+                            None => WriterCommand::Heartbeat(Message::Ping(vec![].into())),
                         };
 
                         match writer_tx.send_control(msg) {
@@ -8594,6 +8598,7 @@ mod rust_tests {
             auth_tracker,
             reconnect_buffer_waits_for_auth,
             None,
+            None,
         );
 
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -8852,6 +8857,7 @@ mod rust_tests {
             Arc::clone(&auth_tracker),
             reconnect_buffer_waits_for_auth,
             Some(sink),
+            None,
         );
 
         writer_tx
@@ -8967,6 +8973,7 @@ mod rust_tests {
             Arc::new(OnceLock::new()),
             Arc::new(AtomicBool::new(false)),
             None,
+            None,
         );
 
         writer_tx.send(WriterCommand::Send(control)).unwrap();
@@ -9059,6 +9066,7 @@ mod rust_tests {
             Arc::new(OnceLock::new()),
             Arc::new(AtomicBool::new(false)),
             None,
+            None,
         );
 
         writer_tx.send(WriterCommand::Send(control)).unwrap();
@@ -9106,6 +9114,7 @@ mod rust_tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(OnceLock::new()),
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
         );
 
@@ -9195,6 +9204,7 @@ mod rust_tests {
             Arc::new(OnceLock::new()),
             Arc::new(AtomicBool::new(false)),
             None,
+            None,
         );
 
         writer_tx
@@ -9242,7 +9252,6 @@ mod rust_tests {
             1,
             payload.map(ToString::to_string),
             writer_tx,
-            Arc::new(RttProbe::new()),
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -9274,7 +9283,6 @@ mod rust_tests {
             1,
             None,
             writer_tx,
-            Arc::new(RttProbe::new()),
         );
 
         let _ = tokio::time::timeout(Duration::from_secs(2), writer_rx.recv())
@@ -9327,6 +9335,7 @@ mod rust_tests {
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&auth_tracker),
             reconnect_buffer_waits_for_auth,
+            None,
             None,
         );
 
@@ -9450,6 +9459,7 @@ mod rust_tests {
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&auth_tracker),
             reconnect_buffer_waits_for_auth,
+            None,
             None,
         );
 
@@ -9819,6 +9829,7 @@ mod rust_tests {
             Arc::clone(&auth_tracker),
             Arc::clone(&reconnect_buffer_waits_for_auth),
             None,
+            None,
         );
 
         writer_tx
@@ -9874,6 +9885,7 @@ mod rust_tests {
             Arc::clone(&connection_epoch),
             Arc::new(OnceLock::new()),
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
         );
 
@@ -9950,6 +9962,7 @@ mod rust_tests {
             Arc::clone(&connection_epoch),
             auth_tracker,
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
         );
 
@@ -10154,6 +10167,7 @@ mod rust_tests {
             Arc::clone(&auth_tracker),
             Arc::clone(&reconnect_buffer_waits_for_auth),
             None,
+            None,
         );
 
         writer_tx
@@ -10258,6 +10272,7 @@ mod rust_tests {
             Arc::clone(&connection_epoch),
             Arc::clone(&auth_tracker),
             Arc::clone(&reconnect_buffer_waits_for_auth),
+            None,
             None,
         );
 
@@ -10374,6 +10389,7 @@ mod rust_tests {
             Arc::clone(&connection_epoch),
             Arc::clone(&auth_tracker),
             Arc::clone(&reconnect_buffer_waits_for_auth),
+            None,
             None,
         );
 
@@ -10500,6 +10516,7 @@ mod rust_tests {
             Arc::clone(&connection_epoch),
             Arc::clone(&auth_tracker),
             Arc::clone(&reconnect_buffer_waits_for_auth),
+            None,
             None,
         );
 
